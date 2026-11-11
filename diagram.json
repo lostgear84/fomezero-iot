@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "author": "FOMEZERO - GS 2026.2",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "esp",
+      "top": 0,
+      "left": 250,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-dht22",
+      "id": "dht1",
+      "top": 10,
+      "left": 470,
+      "attrs": {
+        "temperature": "4",
+        "humidity": "70"
+      }
+    },
+    {
+      "type": "wokwi-hc-sr04",
+      "id": "hcsr",
+      "top": 200,
+      "left": 470,
+      "attrs": {
+        "distance": "12"
+      }
+    },
+    {
+      "type": "wokwi-resistor",
+      "id": "r1",
+      "top": 120,
+      "left": 120,
+      "attrs": {
+        "value": "220"
+      }
+    },
+    {
+      "type": "wokwi-led",
+      "id": "led1",
+      "top": 210,
+      "left": 100,
+      "attrs": {
+        "color": "red"
+      }
+    }
+  ],
+  "connections": [],
+  "dependencies": {},
+  "serialMonitor": {
+    "display": "terminal",
+    "convertEol": true
+  }
+}

@@ -1,0 +1,144 @@
+[
+  {
+    "id": "fz-tab",
+    "type": "tab",
+    "label": "FOMEZERO - IoT",
+    "disabled": false,
+    "info": ""
+  },
+  {
+    "id": "fz-broker",
+    "type": "mqtt-broker",
+    "name": "Mosquitto local",
+    "broker": "mosquitto",
+    "port": "1883",
+    "clientid": "fomezero-nodered",
+    "autoConnect": true,
+    "usetls": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": true
+  },
+  {
+    "id": "fz-in",
+    "type": "mqtt in",
+    "z": "fz-tab",
+    "name": "Entrada do ESP32",
+    "topic": "fomezero/gs2026/rm564896/lote/+/#",
+    "qos": "1",
+    "datatype": "utf8",
+    "broker": "fz-broker",
+    "x": 150,
+    "y": 120,
+    "wires": [
+      [
+        "fz-converter"
+      ]
+    ]
+  },
+  {
+    "id": "fz-converter",
+    "type": "function",
+    "z": "fz-tab",
+    "name": "Validar e preparar InfluxDB",
+    "func": "\ntry {\n    let p = typeof msg.payload === \"string\"\n        ? JSON.parse(msg.payload)\n        : msg.payload;\n\n    if (!p || typeof p !== \"object\") {\n        throw new Error(\"Payload deve ser objeto\");\n    }\n\n    if (!p.lote_id || !p.device_id) {\n        throw new Error(\"lote_id ou device_id ausente\");\n    }\n\n    const telemetria = p.schema === \"fomezero.telemetria.v1\";\n    const alerta = p.schema === \"fomezero.alerta.v1\";\n\n    if (!telemetria && !alerta) return null;\n\n    function tag(v) {\n        return String(v).replace(/\\\\/g, \"\\\\\\\\\")\n                        .replace(/ /g, \"\\\\ \")\n                        .replace(/,/g, \"\\\\,\")\n                        .replace(/=/g, \"\\\\=\");\n    }\n\n    function str(v) {\n        return '\"' + String(v).replace(/\\\\/g, \"\\\\\\\\\")\n                              .replace(/\"/g, '\\\\\"')\n                              .replace(/[\\r\\n]/g, \" \") + '\"';\n    }\n\n    const campos = [];\n\n    function numero(nome, valor) {\n        if (typeof valor === \"number\" && Number.isFinite(valor)) {\n            campos.push(nome + \"=\" + valor);\n        }\n    }\n\n    // Compatibilidade com o firmware atual, que usa -127 para falha.\n    if (typeof p.temp_c === \"number\" && p.temp_c !== -127) {\n        numero(\"temp_c\", p.temp_c);\n    }\n\n    numero(\"umid_pct\", p.umid_pct);\n    numero(\"limite_c\", p.limite_c);\n    numero(\"seq\", p.seq);\n    numero(\"duracao_acima_s\", p.duracao_acima_s);\n\n    if (typeof p.distancia_cm === \"number\" && p.distancia_cm > 0) {\n        numero(\"distancia_cm\", p.distancia_cm);\n    }\n\n    if (telemetria) {\n        campos.push(\"caixa_presente=\" + (p.caixa_presente ? 1 : 0));\n        campos.push(\"alerta_ativo=\" + (p.estado === \"ALERTA\" ? 1 : 0));\n    }\n\n    campos.push(\"evento=\" + str(p.evento || \"\"));\n    campos.push(\"estado=\" + str(p.estado || (alerta ? \"ativo\" : \"\")));\n    campos.push(\"ts_dispositivo=\" + str(p.ts || \"\"));\n\n    const measurement = telemetria ? \"telemetria\" : \"alertas\";\n    const tags = \",lote_id=\" + tag(p.lote_id)\n        + \",device_id=\" + tag(p.device_id)\n        + \",origem=\" + tag(p.origem || \"nao_informada\");\n\n    // Horario de ingestao no servidor. O timestamp do ESP32 fica em campo separado.\n    msg.payload = measurement + tags + \" \" + campos.join(\",\");\n\n    msg.method = \"POST\";\n    msg.url = env.get(\"INFLUX_URL\")\n        + \"/api/v2/write?org=\" + encodeURIComponent(env.get(\"INFLUX_ORG\"))\n        + \"&bucket=\" + encodeURIComponent(env.get(\"INFLUX_BUCKET\"))\n        + \"&precision=ms\";\n\n    msg.headers = {\n        \"Authorization\": \"Token \" + env.get(\"INFLUX_TOKEN\"),\n        \"Content-Type\": \"text/plain; charset=utf-8\"\n    };\n\n    msg.fz = {\n        telemetria: telemetria,\n        lote_id: p.lote_id,\n        device_id: p.device_id,\n        seq: p.seq,\n        topico_ack: msg.topic.replace(/\\/telemetria$/, \"/comando\")\n    };\n\n    return msg;\n} catch (erro) {\n    node.error(\"Mensagem rejeitada: \" + erro.message, msg);\n    return null;\n}\n",
+    "outputs": 1,
+    "x": 410,
+    "y": 120,
+    "wires": [
+      [
+        "fz-http"
+      ]
+    ]
+  },
+  {
+    "id": "fz-http",
+    "type": "http request",
+    "z": "fz-tab",
+    "name": "Gravar no InfluxDB",
+    "method": "use",
+    "ret": "txt",
+    "paytoqs": "ignore",
+    "url": "",
+    "persist": false,
+    "x": 680,
+    "y": 120,
+    "wires": [
+      [
+        "fz-confirmar"
+      ]
+    ]
+  },
+  {
+    "id": "fz-confirmar",
+    "type": "function",
+    "z": "fz-tab",
+    "name": "ACK somente apos HTTP 204",
+    "func": "\nif (msg.statusCode !== 204) {\n    node.error(\"InfluxDB recusou escrita: HTTP \" + msg.statusCode\n        + \" \" + String(msg.payload), msg);\n    return null;\n}\n\nif (!msg.fz || !msg.fz.telemetria) return null;\n\nmsg.topic = msg.fz.topico_ack;\nmsg.payload = JSON.stringify({\n    schema: \"fomezero.ack.v1\",\n    lote_id: msg.fz.lote_id,\n    device_id: msg.fz.device_id,\n    seq: msg.fz.seq,\n    estado: \"persistido_influxdb\"\n});\ndelete msg.headers;\ndelete msg.url;\nreturn msg;\n",
+    "outputs": 1,
+    "x": 680,
+    "y": 220,
+    "wires": [
+      [
+        "fz-out",
+        "fz-debug"
+      ]
+    ]
+  },
+  {
+    "id": "fz-out",
+    "type": "mqtt out",
+    "z": "fz-tab",
+    "name": "ACK ao ESP32",
+    "topic": "",
+    "qos": "1",
+    "retain": "false",
+    "broker": "fz-broker",
+    "x": 950,
+    "y": 180,
+    "wires": []
+  },
+  {
+    "id": "fz-debug",
+    "type": "debug",
+    "z": "fz-tab",
+    "name": "ACK de persistencia",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "x": 960,
+    "y": 260,
+    "wires": []
+  },
+  {
+    "id": "fz-catch",
+    "type": "catch",
+    "z": "fz-tab",
+    "name": "Capturar erros",
+    "scope": null,
+    "uncaught": false,
+    "x": 180,
+    "y": 340,
+    "wires": [
+      [
+        "fz-erros"
+      ]
+    ]
+  },
+  {
+    "id": "fz-erros",
+    "type": "debug",
+    "z": "fz-tab",
+    "name": "ERROS",
+    "active": true,
+    "tosidebar": true,
+    "console": true,
+    "complete": "error.message",
+    "targetType": "msg",
+    "x": 430,
+    "y": 340,
+    "wires": []
+  }
+]

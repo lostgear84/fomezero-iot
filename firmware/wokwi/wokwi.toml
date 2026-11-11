@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "fomezero_iot.ino.esp32.bin"
+elf = "fomezero_iot.ino.elf"

@@ -1,0 +1,311 @@
+/*
+ * FOMEZERO - modulo IoT da cadeia de frio do lote de doacao
+ * GS 2026.2 - FIAP 2TIAPR-2026 - Physical Computing, Embedded AI, Robotics & Cognitive IoT
+ * Erick Miguel (RM 564896) - Leonardo Melo (RM 567097) - Luna Oliveira (RM 564215)
+ *
+ * Fluxo: DHT22 + HC-SR04 -> ESP32 -> MQTT -> SQLite + alerta no app
+ * Simulado no Wokwi (PlatformIO, env esp32dev)
+ */
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <time.h>
+
+// ---------------- Configuracao ----------------
+const char* WIFI_SSID  = "Wokwi-GUEST";
+const char* WIFI_SENHA = "";
+const char* MQTT_HOST  = "broker.hivemq.com";
+const uint16_t MQTT_PORTA = 1883;
+
+const char* LOTE_ID   = "LOTE-2026-0001";
+const char* DEVICE_ID = "esp32-caixa-01";
+
+const char* TOPICO_TELEMETRIA = "fomezero/gs2026/rm564896/lote/LOTE-2026-0001/telemetria";
+const char* TOPICO_ALERTA     = "fomezero/gs2026/rm564896/lote/LOTE-2026-0001/alerta";
+const char* TOPICO_STATUS     = "fomezero/gs2026/rm564896/lote/LOTE-2026-0001/status";
+const char* TOPICO_COMANDO    = "fomezero/gs2026/rm564896/lote/LOTE-2026-0001/comando";
+
+// ANVISA RDC 216/2004: alimento refrigerado conservado abaixo de 5 C
+const float LIMITE_C    = 5.0;
+const float HISTERESE_C = 4.5;
+
+const unsigned long INTERVALO_LEITURA_MS = 2000;
+const unsigned long INTERVALO_ENVIO_MS   = 10000;
+const unsigned long CONFIRMA_ALERTA_MS   = 30000;
+const unsigned long CONFIRMA_NORMAL_MS   = 60000;
+const unsigned long BACKOFF_CONEXAO_MS   = 5000;
+
+#define PINO_DHT   15
+#define TIPO_DHT   DHT22
+#define PINO_TRIG  5
+#define PINO_ECHO  18
+#define PINO_LED   2
+#define LIMIAR_CAIXA_CM 30.0
+
+DHT dht(PINO_DHT, TIPO_DHT);
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+float tempC = NAN, umidPct = NAN, distCm = NAN;
+bool  caixaPresente = false;
+bool  emAlerta = false;
+bool  tsValido = false;
+unsigned long ultimaLeitura = 0, ultimoEnvio = 0;
+unsigned long inicioAcima = 0, inicioAbaixo = 0;
+unsigned long seq = 0;
+unsigned long ultimaTentativaConexao = 0;
+unsigned long inicioWifi = 0;
+unsigned long reconexoes = 0;
+bool wifiIniciado = false;
+
+#define BUF_MAX 8
+String bufferTopicos[BUF_MAX];
+String bufferPayloads[BUF_MAX];
+uint8_t bufIni = 0, bufQtd = 0;
+
+// ---------------- Fila de retransmissao ----------------
+void enfileira(const char* topico, const String& payload) {
+  if (bufQtd == BUF_MAX) { bufIni = (bufIni + 1) % BUF_MAX; bufQtd--; }
+  uint8_t idx = (bufIni + bufQtd) % BUF_MAX;
+  bufferTopicos[idx] = String(topico);
+  bufferPayloads[idx] = payload;
+  bufQtd++;
+}
+
+void drenaBuffer() {
+  while (bufQtd > 0 && mqtt.connected()) {
+    if (!mqtt.publish(bufferTopicos[bufIni].c_str(), bufferPayloads[bufIni].c_str(), false)) {
+      Serial.printf("[MQTT] publish recusado (state=%d, %u bytes), retenta depois\r\n",
+                    mqtt.state(), bufferPayloads[bufIni].length());
+      return;
+    }
+    bufIni = (bufIni + 1) % BUF_MAX;
+    bufQtd--;
+  }
+}
+
+void publica(const char* topico, const String& payload) {
+  if (mqtt.connected() && mqtt.publish(topico, payload.c_str(), false)) {
+    Serial.printf("[MQTT] publicado em %s (%u bytes, fila=%u)\r\n", topico, payload.length(), bufQtd);
+    return;
+  }
+  enfileira(topico, payload);
+  Serial.printf("[MQTT] enfileirado (fila=%u)\r\n", bufQtd);
+}
+
+// ---------------- Utilitarios ----------------
+String agoraISO() {
+  time_t agora = time(nullptr);
+  if (agora < 1700000000) { tsValido = false; return String("1970-01-01T00:00:00Z"); }
+  tsValido = true;
+  struct tm t;
+  gmtime_r(&agora, &t);
+  char buf[24];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &t);
+  return String(buf);
+}
+
+void leSensores() {
+  float t = dht.readTemperature();
+  float u = dht.readHumidity();
+  if (!isnan(t)) tempC = t;
+  if (!isnan(u)) umidPct = u;
+
+  digitalWrite(PINO_TRIG, LOW); delayMicroseconds(3);
+  digitalWrite(PINO_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PINO_TRIG, LOW);
+  long dur = pulseIn(PINO_ECHO, HIGH, 30000);
+  if (dur > 0) {
+    distCm = dur / 58.0;
+    caixaPresente = (distCm < LIMIAR_CAIXA_CM);
+  } else {
+    distCm = NAN;
+    caixaPresente = false;
+  }
+}
+
+// ---------------- Conectividade ----------------
+void conectaWiFi() {
+  if (WiFi.status() == WL_CONNECTED) { wifiIniciado = false; return; }
+  if (!wifiIniciado) {
+    Serial.printf("[WiFi] conectando em %s\r\n", WIFI_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_SENHA);
+    wifiIniciado = true;
+    inicioWifi = millis();
+    return;
+  }
+  if (millis() - inicioWifi > 15000) {
+    Serial.printf("[WiFi] sem conexao (status=%d), nova tentativa\r\n", (int)WiFi.status());
+    WiFi.disconnect();
+    wifiIniciado = false;
+  }
+}
+
+// ACK do backend chega aqui: e o trafego de ENTRADA que mantem a sessao viva
+void onMensagem(char* topico, byte* payload, unsigned int len) {
+  Serial.printf("[MQTT] ack recebido em %s (%u bytes)\r\n", topico, len);
+}
+
+void conectaMQTT() {
+  if (mqtt.connected()) return;
+
+  unsigned long agora = millis();
+  if (ultimaTentativaConexao != 0 && agora - ultimaTentativaConexao < BACKOFF_CONEXAO_MS) return;
+  ultimaTentativaConexao = agora;
+
+  char clientId[48];
+  snprintf(clientId, sizeof(clientId), "fomezero-%s-%08X", DEVICE_ID, (uint32_t)esp_random());
+
+  char lwt[180];
+  snprintf(lwt, sizeof(lwt),
+    "{\"schema\":\"fomezero.status.v1\",\"lote_id\":\"%s\",\"device_id\":\"%s\",\"estado\":\"offline\"}",
+    LOTE_ID, DEVICE_ID);
+
+  if (!mqtt.connect(clientId, nullptr, nullptr, TOPICO_STATUS, 1, true, lwt)) {
+    Serial.printf("[MQTT] falha ao conectar, state=%d\r\n", mqtt.state());
+    return;
+  }
+  reconexoes++;
+  Serial.printf("[MQTT] conectado ao broker (sessao %lu, uptime %lu s)\r\n",
+                reconexoes, millis() / 1000);
+
+  mqtt.subscribe(TOPICO_COMANDO, 1);
+
+  char on[180];
+  snprintf(on, sizeof(on),
+    "{\"schema\":\"fomezero.status.v1\",\"lote_id\":\"%s\",\"device_id\":\"%s\",\"estado\":\"online\"}",
+    LOTE_ID, DEVICE_ID);
+  mqtt.publish(TOPICO_STATUS, on, true);
+
+  drenaBuffer();
+}
+
+// ---------------- Payloads ----------------
+String payloadTelemetria() {
+  char buf[420];
+  String ts = agoraISO();
+  float t = isnan(tempC)   ? -127.0f : tempC;
+  float u = isnan(umidPct) ? 0.0f    : umidPct;
+  float d = isnan(distCm)  ? 0.0f    : distCm;
+
+  snprintf(buf, sizeof(buf),
+    "{\"schema\":\"fomezero.telemetria.v1\",\"lote_id\":\"%s\",\"device_id\":\"%s\","
+    "\"seq\":%lu,\"ts\":\"%s\",\"ts_valido\":%s,\"uptime_ms\":%lu,"
+    "\"temp_c\":%.1f,\"umid_pct\":%.1f,\"caixa_presente\":%s,\"distancia_cm\":%.1f,"
+    "\"limite_c\":%.1f,\"evento\":\"%s\",\"estado\":\"%s\",\"origem\":\"wokwi\"}",
+    LOTE_ID, DEVICE_ID, seq, ts.c_str(), tsValido ? "true" : "false", millis(),
+    t, u, caixaPresente ? "true" : "false", d, LIMITE_C,
+    emAlerta ? "quebra_cadeia_frio" : "normal", emAlerta ? "ALERTA" : "FRIO_OK");
+  return String(buf);
+}
+
+String payloadAlerta(unsigned long duracaoS) {
+  char buf[420];
+  String ts = agoraISO();
+  float t = isnan(tempC) ? -127.0f : tempC;
+
+  snprintf(buf, sizeof(buf),
+    "{\"schema\":\"fomezero.alerta.v1\",\"lote_id\":\"%s\",\"device_id\":\"%s\","
+    "\"seq\":%lu,\"ts\":\"%s\",\"evento\":\"quebra_cadeia_frio\",\"temp_c\":%.1f,"
+    "\"limite_c\":%.1f,\"duracao_acima_s\":%lu,\"severidade\":\"alta\","
+    "\"acao\":\"alerta_visual_app\",\"origem\":\"wokwi\"}",
+    LOTE_ID, DEVICE_ID, seq, ts.c_str(), t, LIMITE_C, duracaoS);
+  return String(buf);
+}
+
+// ---------------- Maquina de estados do alerta ----------------
+void avaliaEstado() {
+  if (isnan(tempC)) return;
+
+  if (!emAlerta) {
+    if (tempC > LIMITE_C) {
+      if (inicioAcima == 0) inicioAcima = millis();
+      if (millis() - inicioAcima >= CONFIRMA_ALERTA_MS) {
+        emAlerta = true;
+        inicioAbaixo = 0;
+        publica(TOPICO_ALERTA, payloadAlerta((millis() - inicioAcima) / 1000));
+        Serial.printf("[ALERTA] quebra_cadeia_frio temp=%.1f C > limite %.1f C\r\n", tempC, LIMITE_C);
+      }
+    } else {
+      inicioAcima = 0;
+    }
+  } else {
+    if (tempC < HISTERESE_C) {
+      if (inicioAbaixo == 0) inicioAbaixo = millis();
+      if (millis() - inicioAbaixo >= CONFIRMA_NORMAL_MS) {
+        emAlerta = false;
+        inicioAcima = 0;
+        inicioAbaixo = 0;
+        String ts = agoraISO();
+        char fim[240];
+        snprintf(fim, sizeof(fim),
+          "{\"schema\":\"fomezero.alerta.v1\",\"lote_id\":\"%s\",\"device_id\":\"%s\","
+          "\"seq\":%lu,\"ts\":\"%s\",\"evento\":\"quebra_cadeia_frio\","
+          "\"estado\":\"normalizado\",\"temp_c\":%.1f}",
+          LOTE_ID, DEVICE_ID, seq, ts.c_str(), tempC);
+        publica(TOPICO_ALERTA, String(fim));
+        Serial.println("[ALERTA] normalizado: temperatura abaixo da histerese");
+      }
+    } else {
+      inicioAbaixo = 0;
+    }
+  }
+  digitalWrite(PINO_LED, emAlerta ? HIGH : LOW);
+}
+
+// ---------------- Ciclo de vida ----------------
+void setup() {
+  Serial.begin(115200);
+  Serial.print("\x1b[20h"); // Ativa modo de nova linha no terminal
+  pinMode(PINO_TRIG, OUTPUT);
+  pinMode(PINO_ECHO, INPUT);
+  pinMode(PINO_LED, OUTPUT);
+  digitalWrite(PINO_LED, LOW);
+  dht.begin();
+  delay(2000);
+  Serial.println();
+  Serial.println("=== FOMEZERO IoT v3 - cadeia de frio / lote " + String(LOTE_ID) + " ===");
+
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  mqtt.setServer(MQTT_HOST, MQTT_PORTA);
+  mqtt.setKeepAlive(90);
+  mqtt.setSocketTimeout(5);
+  mqtt.setBufferSize(1024);
+  mqtt.setCallback(onMensagem);
+
+  conectaWiFi();
+  conectaMQTT();
+}
+
+void loop() {
+  static bool online = false;
+  if (WiFi.status() != WL_CONNECTED) conectaWiFi();
+
+  if (mqtt.connected()) {
+    if (!online) {
+      online = true;
+      Serial.printf("[MQTT] sessao ativa em %lu s de uptime\r\n", millis() / 1000);
+    }
+  } else if (online) {
+    online = false;
+    Serial.printf("[MQTT] sessao caiu em %lu s de uptime, state=%d\r\n", millis() / 1000, mqtt.state());
+  }
+
+  conectaMQTT();
+  if (mqtt.connected()) mqtt.loop();
+  drenaBuffer();
+
+  unsigned long agora = millis();
+  if (agora - ultimaLeitura >= INTERVALO_LEITURA_MS) {
+    ultimaLeitura = agora;
+    leSensores();
+    avaliaEstado();
+  }
+  if (agora - ultimoEnvio >= INTERVALO_ENVIO_MS) {
+    ultimoEnvio = agora;
+    seq++;
+    publica(TOPICO_TELEMETRIA, payloadTelemetria());
+  }
+}
